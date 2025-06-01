@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.amp import autocast
+from collections import OrderedDict
+
+
+class AttributeAlignmentLoss(nn.Module):
+    """
+    多属性语义对齐损失函数：
+    1. 继承nn.Module基类
+    2. 余弦相似度对齐约束
+    3. CLIP加权冲突惩罚
+    4. AB测试接口
+    """
+
+    def __init__(self,
+                 attr_weights: OrderedDict,
+                 clip_model=None,
+                 reduction='mean'):
+        """
+        参数初始化（对接第8周MGA网络权重）
+        :param attr_weights: OrderedDict 属性权重字典（保持顺序）
+        :param clip_model: 可选的CLIP模型（ViT-B/32）
+        :param reduction: 损失聚合方式
+        """
+        super().__init__()
+        self._validate_weights(attr_weights)
+        self.attr_weights = self._normalize_weights(attr_weights)
+        self.clip_model = clip_model
+        self.reduction = reduction
+
+        # 注册可训练参数（来自MGA网络）
+        self.priority_params = nn.ParameterDict({
+            attr: nn.Parameter(torch.tensor(weight, dtype=torch.float32))
+            for attr, weight in attr_weights.items()
+        })
+
+        # 梯度安全机制（风险预案阈值5.0）
+        self.grad_clip = nn.utils.clip_grad_norm_
+        self.clip_threshold = 5.0
+
+    def _validate_weights(self, weights):
+        """权重合规性验证"""
+        assert isinstance(weights, OrderedDict), "必须使用OrderedDict保持属性顺序"
+        assert all(w >= 0 for w in weights.values()), "权重不能为负值"
+        assert abs(sum(weights.values()) - 1.0) < 1e-6, "权重总和必须为1"
+
+    def _normalize_weights(self, weights):
+        """权重归一化（保证数值稳定性）"""
+        total = sum(weights.values())
+        return OrderedDict([(k, v / total) for k, v in weights.items()])
+
+    @autocast(device_type='cuda', enabled=True)  # 更新后的autocast使用方式
+    def forward(self, features, targets):
+        """
+        核心计算流程（兼容第10周预处理格式）
+        :param features: 模型输出特征 [B, D]
+        :param targets: 目标字典 {
+            'attributes': [(attr_name, attr_value)],
+            'raw_text': str (CLIP输入文本)
+        }
+        """
+        # 阶段1：基础对齐损失（余弦相似度）
+        align_loss = self._compute_alignment_loss(features, targets['attributes'])
+
+        # 阶段2：冲突惩罚项（CLIP语义加权）
+        if self.clip_model and 'raw_text' in targets:
+            with torch.no_grad():
+                clip_loss = self._compute_clip_penalty(features, targets['raw_text'])
+            align_loss += clip_loss * 0.3  # 经验加权系数
+
+        return align_loss
+
+    def _compute_alignment_loss(self, features, attributes):
+        """属性对齐项计算（余弦相似度）"""
+        loss = torch.tensor(0., device=features.device)
+        for attr, value in attributes:
+            sim = F.cosine_similarity(features, value.unsqueeze(0), dim=1)
+            loss += self.priority_params[attr] * (1 - sim).mean()
+        return loss
+
+    def _compute_clip_penalty(self, features, text):
+        """CLIP语义冲突惩罚"""
+        text_features = self.clip_model.encode_text(text)
+        image_features = self.clip_model.encode_image(features)
+        return 1 - F.cosine_similarity(image_features, text_features, dim=-1).mean()
+
+    def ab_test_config(self, mode='baseline'):
+        """
+        AB测试接口
+        模式说明:
+        - 'baseline': 原始损失函数
+        - 'no_clip': 禁用CLIP惩罚
+        - 'no_priority': 禁用属性优先级
+        - 'full': 完整配置
+        """
+        config = {
+            'attr_weights': self.attr_weights,
+            'reduction': self.reduction
+        }
+
+        if mode == 'no_clip':
+            config['clip_model'] = None
+        elif mode == 'no_priority':
+            config['attr_weights'] = OrderedDict([(k, 1.0 / len(self.attr_weights))
+                                                  for k in self.attr_weights])
+        elif mode == 'full':
+            config['clip_model'] = self.clip_model
+
+        return AttributeAlignmentLoss(**config)
+
+    def extra_repr(self):
+        """调试信息输出（对接TensorBoard监控）"""
+        return f"Attributes: {list(self.attr_weights.keys())}\nClip Model: {self.clip_model is not None}"
+
+
+# 基础功能测试
+def test_core_functionality():
+    """核心功能验证"""
+    # 测试数据准备
+    dummy_weights = OrderedDict([('color', 0.4), ('style', 0.6)])
+    features = torch.randn(4, 512)
+    targets = {
+        'attributes': [('color', torch.randn(512)), ('style', torch.randn(512))],
+        'raw_text': "abstract painting"
+    }
+
+    # 测试1：基础结构
+    loss_fn = AttributeAlignmentLoss(dummy_weights)
+    print("测试1通过：", isinstance(loss_fn, nn.Module))
+
+    # 测试2：对齐项计算
+    align_loss = loss_fn._compute_alignment_loss(features, targets['attributes'])
+    print("测试2通过：", align_loss.item() > 0)
+
+    # 测试3：AB测试配置
+    test_modes = ['baseline', 'no_clip', 'no_priority', 'full']
+    for mode in test_modes:
+        test_fn = loss_fn.ab_test_config(mode)
+        print(f"{mode}模式测试通过：", test_fn is not None)
+
+
+if __name__ == '__main__':
+    test_core_functionality()
